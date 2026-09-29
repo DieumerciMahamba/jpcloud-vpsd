@@ -1,0 +1,444 @@
+#!/usr/bin/env bash
+# /usr/local/sbin/jpcloud-netctl — SEUL programme que jpcloud-vpsd peut executer
+# en root (via sudoers NOPASSWD etroit). Chaque sous-commande valide TOUS ses
+# arguments par expression reguliere avant d'agir : aucune injection possible,
+# meme si la couche daemon au-dessus avait un bug de validation.
+#
+# Reglages de topologie reseau FIXES (jamais transmis par l'API, seulement
+# modifiables ici par un administrateur ayant un acces shell au VPS) :
+#   /etc/jpcloud-netctl.conf — WG_PORT, WG_ADDR, OVPN_PORT, OVPN_PROTO, OVPN_NET
+set -euo pipefail
+
+WG_IF="${WG_IF:-wg0}"
+WG_PORT="51820"
+# Ces valeurs par defaut correspondent a vpn_tunnel_net()/vpn_ovpn_tunnel_net()
+# cote wamp64 (reglages vpn_tunnel_subnet="10.99.0" / vpn_ovpn_tunnel_subnet=
+# "10.99.1") — A VERIFIER contre l'installation reelle avant le premier
+# wg-bootstrap (voir README.md, section "Ne PAS faire au premier deploiement").
+WG_ADDR="10.99.0.1/24"
+WG_NET="10.99.0.0/24"
+OVPN_PORT="1194"
+OVPN_PROTO="udp"
+OVPN_NET="10.99.1.0"
+OVPN_NET_CIDR="10.99.1.0/24"
+OVPN_DIR="/etc/openvpn/server"
+OVPN_STATUS_LOG="/var/log/openvpn/status-jpcloud.log"
+OVPN_SERVICE="openvpn-server@jpcloud"
+
+# shellcheck disable=SC1091
+[[ -f /etc/jpcloud-netctl.conf ]] && source /etc/jpcloud-netctl.conf
+
+RE_WG_KEY='^[A-Za-z0-9+/]{42}[AEIMQUYcgkosw480]=$'
+RE_TUN_IP='^([0-9]{1,3}\.){3}[0-9]{1,3}$'
+RE_OVPN_USER='^jpc-u[0-9]{1,10}r[0-9]{1,10}$'
+RE_SHA256='^[a-f0-9]{64}$'
+RE_ROUTER_ID='^[1-9][0-9]{0,9}$'
+RE_UNIT='^(wg-quick@wg0|openvpn-server@jpcloud|jpcloud-vpsd)$'
+RE_LINES='^[0-9]{1,3}$'
+RE_B64='^[A-Za-z0-9+/=]{1,40000}$'
+RE_MODE='^(rotate|norotate)$'
+
+die() { echo "ERR: $*" >&2; exit 2; }
+check() { [[ "${1:-}" =~ $2 ]] || die "argument invalide"; }
+
+# ───────────────────────── WireGuard ─────────────────────────
+
+wg_persist() {
+  local conf="/etc/wireguard/${WG_IF}.conf"
+  [[ -f "$conf" ]] || return 0
+  local tmp_iface tmp_peers
+  tmp_iface=$(mktemp) tmp_peers=$(mktemp)
+  awk 'BEGIN{p=1} /^\[Peer\]/{p=0} p' "$conf" > "$tmp_iface"
+  wg showconf "$WG_IF" 2>/dev/null | awk '/^\[Peer\]/{p=1} p' > "$tmp_peers"
+  cat "$tmp_iface" "$tmp_peers" > "$conf"
+  chmod 600 "$conf"
+  rm -f "$tmp_iface" "$tmp_peers"
+}
+
+cmd_wg_add() {
+  check "${1:-}" "$RE_WG_KEY"; check "${2:-}" "$RE_TUN_IP"
+  wg set "$WG_IF" peer "$1" allowed-ips "$2/32" persistent-keepalive 25
+  ip route replace "$2/32" dev "$WG_IF" 2>/dev/null || true
+  wg_persist
+}
+
+cmd_wg_del() {
+  check "${1:-}" "$RE_WG_KEY"
+  wg set "$WG_IF" peer "$1" remove
+  wg_persist
+}
+
+cmd_wg_status() {
+  wg show "$WG_IF" dump | awk -v OFS='\t' '
+    NR==1 { print "#IFACE"; print $2, $3; print "#PEERS"; next }
+    { print $1, $3, $4, $5, $6, $7 }
+  '
+}
+
+cmd_wg_bootstrap() {
+  local mode="${1:-norotate}"
+  check "$mode" "$RE_MODE"
+
+  local conf="/etc/wireguard/${WG_IF}.conf"
+  local privfile="/etc/wireguard/server_private.key"
+  local pubfile="/etc/wireguard/server_public.key"
+
+  if ! command -v wg >/dev/null 2>&1 || ! command -v wg-quick >/dev/null 2>&1; then
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update -y -q >/dev/null 2>&1 || true
+    apt-get install -y -q wireguard wireguard-tools >/dev/null 2>&1 || true
+  fi
+  if ! command -v wg >/dev/null 2>&1 || ! command -v wg-quick >/dev/null 2>&1; then
+    echo '{"ok":false,"error":"wireguard/wireguard-tools introuvable apres installation"}'
+    return 0
+  fi
+
+  local privkey="" generated="false"
+  if [[ "$mode" != "rotate" ]]; then
+    [[ -f "$privfile" ]] && privkey=$(cat "$privfile" 2>/dev/null || true)
+    if [[ -z "$privkey" && -f "$conf" ]]; then
+      privkey=$(awk -F ' = ' '/^PrivateKey/{print $2; exit}' "$conf" 2>/dev/null || true)
+    fi
+  fi
+  if [[ -z "$privkey" ]]; then
+    privkey=$(wg genkey)
+    generated="true"
+  fi
+  local pubkey
+  pubkey=$(printf '%s\n' "$privkey" | wg pubkey)
+  if [[ -z "$pubkey" ]]; then
+    echo '{"ok":false,"error":"cle publique WireGuard non derivee"}'
+    return 0
+  fi
+
+  # Preserve les pairs deja charges dans le noyau AVANT toute coupure d'interface.
+  local peers_block=""
+  if wg show "$WG_IF" >/dev/null 2>&1; then
+    peers_block=$(wg showconf "$WG_IF" 2>/dev/null | awk '/^\[Peer\]/{p=1} p' || true)
+  elif [[ -f "$conf" ]]; then
+    peers_block=$(awk 'BEGIN{p=0} /^\[Peer\]/{p=1} p' "$conf" || true)
+  fi
+  local npeers
+  npeers=$(printf '%s\n' "$peers_block" | grep -c '^\[Peer\]' || true)
+
+  local mainif
+  mainif=$(ip route 2>/dev/null | awk '/^default/{print $5; exit}')
+  [[ "$mainif" =~ ^[A-Za-z0-9._:-]+$ ]] || mainif="eth0"
+
+  mkdir -p /etc/wireguard
+  [[ -f "$conf" ]] && cp -a "$conf" "${conf}.bak_$(date +%s)" 2>/dev/null || true
+
+  {
+    echo "[Interface]"
+    echo "Address = ${WG_ADDR}"
+    echo "ListenPort = ${WG_PORT}"
+    echo "PrivateKey = ${privkey}"
+    echo "PostUp   = iptables -A FORWARD -i %i -j ACCEPT; iptables -A FORWARD -o %i -j ACCEPT; iptables -t nat -A POSTROUTING -o ${mainif} -j MASQUERADE"
+    echo "PostDown = iptables -D FORWARD -i %i -j ACCEPT; iptables -D FORWARD -o %i -j ACCEPT; iptables -t nat -D POSTROUTING -o ${mainif} -j MASQUERADE"
+    if [[ -n "$peers_block" ]]; then printf '\n%s\n' "$peers_block"; fi
+  } > "$conf"
+  chmod 600 "$conf"
+  printf '%s\n' "$privkey" > "$privfile"; chmod 600 "$privfile"
+  printf '%s\n' "$pubkey" > "$pubfile"
+
+  systemctl stop "wg-quick@${WG_IF}" >/dev/null 2>&1 || true
+  wg-quick down "$WG_IF" >/dev/null 2>&1 || true
+  ip link delete "$WG_IF" >/dev/null 2>&1 || true
+  systemctl reset-failed "wg-quick@${WG_IF}" >/dev/null 2>&1 || true
+  sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1 || true
+  grep -q '^net.ipv4.ip_forward=1' /etc/sysctl.conf 2>/dev/null || echo 'net.ipv4.ip_forward=1' >> /etc/sysctl.conf
+
+  systemctl enable "wg-quick@${WG_IF}" >/dev/null 2>&1 || true
+  systemctl start "wg-quick@${WG_IF}" >/dev/null 2>&1 || true
+  sleep 1
+
+  local active
+  active=$(systemctl is-active "wg-quick@${WG_IF}" 2>/dev/null || echo inactive)
+  if [[ "$active" != "active" ]]; then
+    printf '{"ok":false,"error":"wg-quick@%s n a pas demarre","generated":%s}\n' "$WG_IF" "$generated"
+    return 0
+  fi
+  printf '{"ok":true,"pubkey":"%s","peers":%s,"generated":%s}\n' "$pubkey" "${npeers:-0}" "$generated"
+}
+
+# ───────────────────────── OpenVPN ─────────────────────────
+
+cmd_ovpn_add() {
+  check "${1:-}" "$RE_OVPN_USER"; check "${2:-}" "$RE_TUN_IP"; check "${3:-}" "$RE_SHA256"
+  mkdir -p "${OVPN_DIR}/users" "${OVPN_DIR}/ccd"
+  printf '%s\n' "$3" > "${OVPN_DIR}/users/$1"
+  chown root:nogroup "${OVPN_DIR}/users/$1"; chmod 640 "${OVPN_DIR}/users/$1"
+  printf 'ifconfig-push %s 255.255.255.0\n' "$2" > "${OVPN_DIR}/ccd/$1"
+  chmod 644 "${OVPN_DIR}/ccd/$1"
+}
+
+cmd_ovpn_del() {
+  check "${1:-}" "$RE_OVPN_USER"
+  rm -f "${OVPN_DIR}/users/$1" "${OVPN_DIR}/ccd/$1"
+}
+
+cmd_ovpn_ca() {
+  local ca="${OVPN_DIR}/easyrsa/pki/ca.crt"
+  [[ -f "$ca" ]] || die "CA OpenVPN absente — lancer ovpn-bootstrap d'abord"
+  cat "$ca"
+}
+
+cmd_ovpn_status() {
+  [[ -f "$OVPN_STATUS_LOG" ]] || exit 0
+  # status-version 2 (CSV) : CLIENT_LIST,cn,real_addr,virt_addr,virt_ipv6,rx,tx,since,since_epoch,username,...
+  awk -F',' '$1=="CLIENT_LIST"{ split($3,a,":"); print $2"\t"a[1]"\t"$4"\t"$9 }' "$OVPN_STATUS_LOG"
+}
+
+cmd_ovpn_bootstrap() {
+  local dir="$OVPN_DIR"
+  local pki="${dir}/easyrsa/pki"
+  mkdir -p "${dir}/users" "${dir}/ccd"
+  chown root:nogroup "${dir}/users"; chmod 750 "${dir}/users"
+
+  if ! command -v openvpn >/dev/null 2>&1 || ! command -v easyrsa >/dev/null 2>&1; then
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update -y -q >/dev/null 2>&1 || true
+    apt-get install -y -q openvpn easy-rsa >/dev/null 2>&1 || true
+  fi
+  if ! command -v openvpn >/dev/null 2>&1; then
+    echo '{"ok":false,"error":"openvpn introuvable apres installation"}'
+    return 0
+  fi
+
+  if [[ ! -f "${pki}/ca.crt" ]]; then
+    rm -rf "${dir}/easyrsa"
+    make-cadir "${dir}/easyrsa" >/dev/null 2>&1 || mkdir -p "${dir}/easyrsa"
+    ln -sf /usr/share/easy-rsa/easyrsa "${dir}/easyrsa/easyrsa" 2>/dev/null || true
+    (
+      cd "${dir}/easyrsa"
+      ./easyrsa init-pki >/dev/null 2>&1
+      EASYRSA_BATCH=1 EASYRSA_REQ_CN="JPCloud CA" ./easyrsa build-ca nopass >/dev/null 2>&1
+      EASYRSA_BATCH=1 ./easyrsa build-server-full server nopass >/dev/null 2>&1
+      ./easyrsa gen-dh >/dev/null 2>&1
+    ) || true
+  fi
+  if [[ ! -f "${pki}/ca.crt" ]]; then
+    echo '{"ok":false,"error":"generation de la CA OpenVPN echouee"}'
+    return 0
+  fi
+
+  cat > "${dir}/jpcloud-auth.sh" <<'AUTHEOF'
+#!/bin/sh
+f="$1"
+u=$(sed -n 1p "$f")
+p=$(sed -n 2p "$f")
+echo "$u" | grep -Eq '^jpc-u[0-9]{1,10}r[0-9]{1,10}$' || exit 1
+[ -f "/etc/openvpn/server/users/$u" ] || exit 1
+h=$(printf '%s' "$p" | sha256sum | cut -d' ' -f1)
+[ "$h" = "$(cat "/etc/openvpn/server/users/$u")" ] && exit 0
+exit 1
+AUTHEOF
+  chmod 755 "${dir}/jpcloud-auth.sh"
+
+  cat > "${dir}/jpcloud.conf" <<CONFEOF
+port ${OVPN_PORT}
+proto ${OVPN_PROTO}
+dev tun-jpc
+topology subnet
+server ${OVPN_NET} 255.255.255.0
+
+ca   ${pki}/ca.crt
+cert ${pki}/issued/server.crt
+key  ${pki}/private/server.key
+dh   ${pki}/dh.pem
+
+verify-client-cert none
+username-as-common-name
+script-security 2
+auth-user-pass-verify ${dir}/jpcloud-auth.sh via-file
+client-config-dir ${dir}/ccd
+ccd-exclusive
+
+# RouterOS v6 (client vise par ce transport) ne negocie PAS le chiffrement
+# OpenVPN : combinaison fixe requise, pas d'AEAD/GCM.
+data-ciphers AES-256-CBC
+data-ciphers-fallback AES-256-CBC
+auth SHA1
+
+keepalive 10 60
+persist-key
+persist-tun
+user nobody
+group nogroup
+
+status ${OVPN_STATUS_LOG} 10
+status-version 2
+verb 3
+CONFEOF
+
+  systemctl enable "$OVPN_SERVICE" >/dev/null 2>&1 || true
+  systemctl restart "$OVPN_SERVICE" >/dev/null 2>&1 || true
+  sleep 1
+  local active
+  active=$(systemctl is-active "$OVPN_SERVICE" 2>/dev/null || echo inactive)
+  if [[ "$active" != "active" ]]; then
+    echo '{"ok":false,"error":"openvpn-server@jpcloud n a pas demarre"}'
+    return 0
+  fi
+  echo '{"ok":true}'
+}
+
+# ───────────────────────── Redirections (nftables) ─────────────────────────
+
+nft_ensure_table() {
+  # Contrairement a wg/openvpn (verifies avant chaque bootstrap), les
+  # redirections sont appelees a CHAQUE provisionnement de routeur — auto-
+  # installation si absent, pour ne pas dependre d'une etape manuelle oubliee
+  # sur un VPS qui n'aurait jusque-la que l'ancien iptables/ufw.
+  if ! command -v nft >/dev/null 2>&1; then
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update -y -q >/dev/null 2>&1 || true
+    apt-get install -y -q nftables >/dev/null 2>&1 || true
+  fi
+  command -v nft >/dev/null 2>&1 || die "nftables introuvable et installation echouee"
+
+  # add table/map/chain SONT idempotents en nftables (no-op si l'objet existe
+  # deja a l'identique) — appelables sans risque a chaque redir-set/redir-clear.
+  nft add table ip jpcloud_nat 2>/dev/null || true
+  nft add map ip jpcloud_nat redir_tcp '{ type inet_service : ipv4_addr . inet_service; }' 2>/dev/null || true
+  nft add map ip jpcloud_nat redir_udp '{ type inet_service : ipv4_addr . inet_service; }' 2>/dev/null || true
+  nft add chain ip jpcloud_nat prerouting '{ type nat hook prerouting priority dstnat; }' 2>/dev/null || true
+  nft add chain ip jpcloud_nat postrouting '{ type nat hook postrouting priority srcnat; }' 2>/dev/null || true
+
+  # "add rule" n'est PAS idempotent (contrairement a add table/map/chain) :
+  # une regle n'a pas d'identite propre, donc un second appel en ajouterait
+  # une DEUXIEME copie — sur la duree (appele a chaque provisionnement de
+  # routeur), la chaine finirait avec des dizaines de regles dupliquees.
+  # On verifie donc explicitement l'absence avant d'ajouter.
+  if ! nft list chain ip jpcloud_nat prerouting 2>/dev/null | grep -q 'dport vmap @redir_tcp'; then
+    nft add rule ip jpcloud_nat prerouting tcp dport vmap @redir_tcp 2>/dev/null || true
+  fi
+  if ! nft list chain ip jpcloud_nat prerouting 2>/dev/null | grep -q 'dport vmap @redir_udp'; then
+    nft add rule ip jpcloud_nat prerouting udp dport vmap @redir_udp 2>/dev/null || true
+  fi
+  # Masquerade uniquement le trafic redirige VERS nos sous-reseaux de tunnel
+  # (pas un masquerade global) — le retour du paquet DNAT route correctement.
+  if ! nft list chain ip jpcloud_nat postrouting 2>/dev/null | grep -q 'masquerade'; then
+    nft add rule ip jpcloud_nat postrouting ip daddr "{ ${WG_NET}, ${OVPN_NET_CIDR} }" masquerade 2>/dev/null || true
+  fi
+}
+
+# jq n'est pas suppose etre installe sur un VPS minimal : parsing JSON fait en
+# python3 (present par defaut sur les images Ubuntu Server) pour rester
+# lisible/robuste. Auto-installation defensive au cas ou (meme pattern que
+# wg/openvpn/nft ci-dessus) plutot que de supposer sa presence sans verifier.
+json_get() {
+  if ! command -v python3 >/dev/null 2>&1; then
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update -y -q >/dev/null 2>&1 || true
+    apt-get install -y -q python3 >/dev/null 2>&1 || true
+  fi
+  command -v python3 >/dev/null 2>&1 || die "python3 introuvable et installation echouee"
+  python3 -c "
+import json,sys
+d = json.loads(sys.stdin.read())
+$1
+"
+}
+
+cmd_redir_set() {
+  check "${1:-}" "$RE_ROUTER_ID"; check "${2:-}" "$RE_TUN_IP"; check "${3:-}" "$RE_B64"
+  local tun="$2" b64="$3"
+  nft_ensure_table
+  local payload
+  payload=$(printf '%s' "$b64" | base64 -d) || die "payload invalide"
+
+  local all_ports rules
+  all_ports=$(printf '%s' "$payload" | json_get "print(' '.join(str(int(p)) for p in d.get('allPorts', [])))") \
+    || die "payload JSON invalide (allPorts)"
+  for p in $all_ports; do
+    [[ "$p" =~ ^[0-9]{1,5}$ ]] || die "port invalide dans allPorts"
+    nft delete element ip jpcloud_nat redir_tcp "{ $p }" 2>/dev/null || true
+    nft delete element ip jpcloud_nat redir_udp "{ $p }" 2>/dev/null || true
+  done
+
+  rules=$(printf '%s' "$payload" | json_get "
+for r in d.get('rules', []):
+    print(r['proto'], int(r['pub']), int(r['int']))
+") || die "payload JSON invalide (rules)"
+  while IFS=' ' read -r proto pub int; do
+    [[ -z "${proto:-}" ]] && continue
+    [[ "$proto" == "tcp" || "$proto" == "udp" ]] || die "protocole invalide"
+    [[ "$pub" =~ ^[0-9]{1,5}$ && "$int" =~ ^[0-9]{1,5}$ ]] || die "port invalide dans rules"
+    nft add element ip jpcloud_nat "redir_${proto}" "{ ${pub} : ${tun} . ${int} }"
+  done <<< "$rules"
+
+  # FORWARD : meme mecanique eprouvee que l'ancien chemin SSH (insertion en
+  # tete, idempotente) — reste sur iptables pour passer AVANT la politique
+  # DROP d'UFW, qui gere sa propre chaine FORWARD independamment de nftables.
+  # Revalidation defensive (les valeurs sont deja passees par la validation
+  # ci-dessus, mais cette boucle tourne dans un sous-shell separe).
+  printf '%s' "$rules" | while IFS=' ' read -r proto pub int; do
+    [[ "$proto" =~ ^(tcp|udp)$ && "$pub" =~ ^[0-9]{1,5}$ && "$int" =~ ^[0-9]{1,5}$ ]] || continue
+    iptables -C FORWARD -p "$proto" -d "$tun" --dport "$int" -j ACCEPT 2>/dev/null || iptables -I FORWARD 1 -p "$proto" -d "$tun" --dport "$int" -j ACCEPT
+    ufw allow "${pub}/${proto}" comment 'JPCloud redir' >/dev/null 2>&1 || true
+  done
+}
+
+cmd_redir_clear() {
+  check "${1:-}" "$RE_ROUTER_ID"; check "${2:-}" "$RE_B64"
+  local b64="$2"
+  nft_ensure_table
+  local payload all_ports
+  payload=$(printf '%s' "$b64" | base64 -d) || die "payload invalide"
+  all_ports=$(printf '%s' "$payload" | json_get "print(' '.join(str(int(p)) for p in d.get('allPorts', [])))") \
+    || die "payload JSON invalide (allPorts)"
+  for p in $all_ports; do
+    [[ "$p" =~ ^[0-9]{1,5}$ ]] || die "port invalide dans allPorts"
+    nft delete element ip jpcloud_nat redir_tcp "{ $p }" 2>/dev/null || true
+    nft delete element ip jpcloud_nat redir_udp "{ $p }" 2>/dev/null || true
+  done
+}
+
+# ───────────────────────── Systeme ─────────────────────────
+
+cmd_sys_info() {
+  echo "UPTIME=$(uptime -p 2>/dev/null || true)"
+  echo "MEM=$(free -h 2>/dev/null | awk '/^Mem:/{print $3"/"$2}')"
+  echo "DISK=$(df -h / 2>/dev/null | awk 'NR==2{print $3"/"$2" ("$5")"}')"
+  echo "WG_STATUS=$(systemctl is-active "wg-quick@${WG_IF}" 2>/dev/null || echo inactive)"
+  echo "OVPN_STATUS=$(systemctl is-active "$OVPN_SERVICE" 2>/dev/null || echo inactive)"
+  echo "OS=$(lsb_release -ds 2>/dev/null || (. /etc/os-release 2>/dev/null && echo "$PRETTY_NAME"))"
+}
+
+cmd_sys_logs() {
+  check "${1:-}" "$RE_UNIT"; check "${2:-}" "$RE_LINES"
+  journalctl -u "$1" -n "$2" --no-pager --output=short-iso 2>/dev/null || echo "journalctl indisponible"
+}
+
+cmd_sys_ping() {
+  check "${1:-}" "$RE_TUN_IP"
+  local out
+  out=$(ping -c 4 -W 2 "$1" 2>&1 || true)
+  local loss rtt
+  loss=$(printf '%s' "$out" | grep -oE '[0-9]+% packet loss' | head -1 | grep -oE '^[0-9]+%' || true)
+  rtt=$(printf '%s' "$out" | grep -oE 'rtt[^=]+= [0-9.]+/[0-9.]+/[0-9.]+' | awk -F'/' '{print $2}' || true)
+  echo "LOSS=${loss}"
+  echo "RTT=${rtt}ms"
+}
+
+# ───────────────────────── Repartition ─────────────────────────
+
+cmd="${1:-}"; shift || true
+case "$cmd" in
+  wg-add)        cmd_wg_add "$@" ;;
+  wg-del)        cmd_wg_del "$@" ;;
+  wg-status)     cmd_wg_status "$@" ;;
+  wg-bootstrap)  cmd_wg_bootstrap "$@" ;;
+  ovpn-add)      cmd_ovpn_add "$@" ;;
+  ovpn-del)      cmd_ovpn_del "$@" ;;
+  ovpn-status)   cmd_ovpn_status "$@" ;;
+  ovpn-bootstrap) cmd_ovpn_bootstrap "$@" ;;
+  ovpn-ca)       cmd_ovpn_ca "$@" ;;
+  redir-set)     cmd_redir_set "$@" ;;
+  redir-clear)   cmd_redir_clear "$@" ;;
+  sys-info)      cmd_sys_info "$@" ;;
+  sys-logs)      cmd_sys_logs "$@" ;;
+  sys-ping)      cmd_sys_ping "$@" ;;
+  *) die "commande inconnue" ;;
+esac

@@ -1,0 +1,27 @@
+# /etc/jpcloud-netctl.conf — reglages de topologie reseau FIXES, lus par
+# jpcloud-netctl. Jamais transmis par l'API (le daemon ne peut PAS les
+# modifier) — seul un administrateur avec un shell root peut les changer.
+#
+# Adapter WG_ADDR/WG_NET si ce VPS a deja un reseau WireGuard existant avec
+# un adressage different (verifier `cat /etc/wireguard/wg0.conf` AVANT le
+# premier appel a `wg-bootstrap` — ne jamais lancer wg-bootstrap sur le VPS
+# de production sans avoir confirme que ces valeurs correspondent a
+# l'existant, sous peine de reprovisionner tous les routeurs connectes).
+#
+# Installer : sudo install -m 644 jpcloud-netctl.conf.example /etc/jpcloud-netctl.conf
+#             puis editer les valeurs ci-dessous.
+
+# Ces valeurs doivent correspondre a vpn_tunnel_net()/vpn_ovpn_tunnel_net()
+# cote wamp64 (admin/vpn_settings.php -> vpn_tunnel_subnet / vpn_ovpn_tunnel_subnet).
+WG_IF="wg0"
+WG_PORT="51820"
+WG_ADDR="10.99.0.1/24"
+WG_NET="10.99.0.0/24"
+
+OVPN_PORT="1194"
+OVPN_PROTO="udp"
+OVPN_NET="10.99.1.0"
+OVPN_NET_CIDR="10.99.1.0/24"
+OVPN_DIR="/etc/openvpn/server"
+OVPN_STATUS_LOG="/var/log/openvpn/status-jpcloud.log"
+OVPN_SERVICE="openvpn-server@jpcloud"

@@ -1,0 +1,5 @@
+# /etc/sudoers.d/jpcloud — le daemon jpcloud-vpsd (utilisateur systeme non
+# privilegie) peut executer UNIQUEMENT ce script en root. Installer avec :
+#   sudo install -m 440 sudoers-jpcloud /etc/sudoers.d/jpcloud
+#   sudo visudo -c   # doit afficher « parsed OK »
+jpcloud ALL=(root) NOPASSWD: /usr/local/sbin/jpcloud-netctl

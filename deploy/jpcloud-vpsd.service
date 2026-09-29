@@ -1,0 +1,23 @@
+# /etc/systemd/system/jpcloud-vpsd.service
+[Unit]
+Description=JPCloud VPS daemon — pilotage WireGuard/OpenVPN/redirections (remplace le pilotage SSH depuis wamp64)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=jpcloud
+Group=jpcloud
+WorkingDirectory=/opt/jpcloud-vpsd
+ExecStart=/usr/bin/node src/app.js
+Restart=always
+RestartSec=5
+Environment=NODE_ENV=production
+# NoNewPrivileges reste desactive (defaut systemd) : ce service DOIT pouvoir
+# executer `sudo` (setuid) pour atteindre jpcloud-netctl — c'est son seul
+# chemin vers le reseau/root, voir src/netctl.js. L'activer casserait
+# silencieusement tous les appels sudo.
+ProtectSystem=strict
+ReadWritePaths=/opt/jpcloud-vpsd
+
+[Install]
+WantedBy=multi-user.target

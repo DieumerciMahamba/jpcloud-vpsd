@@ -1,0 +1,17 @@
+{
+  "name": "jpcloud-vpsd",
+  "version": "1.0.0",
+  "description": "JPCloud — daemon resident du VPS : pilotage WireGuard/OpenVPN/redirections via jpcloud-netctl, remplace le pilotage SSH depuis wamp64/jpcloud.",
+  "main": "src/app.js",
+  "private": true,
+  "scripts": {
+    "start": "node src/app.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.5",
+    "express": "^4.21.2"
+  }
+}
